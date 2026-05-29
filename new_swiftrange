@@ -1,0 +1,145 @@
+import hashlib
+import random
+
+# ==========================================
+# 1. 密码学参数与群设置 
+# ==========================================
+# 为了让代码可独立运行，我们使用一个标准的 1024-bit 安全素数 (RFC 2409)
+P = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF",
+    16)
+Q = (P - 1) // 2  # 素数阶
+
+
+def get_random_generator():
+    """生成 Z_p 上的随机生成元"""
+    while True:
+        g = random.randint(2, P - 1)
+        if pow(g, 2, P) != 1 and pow(g, Q, P) == 1:
+            return g
+
+
+def hash_to_scalar(*args):
+    h = hashlib.sha256()
+    for arg in args:
+        h.update(str(arg).encode('utf-8'))
+    return int(h.hexdigest(), 16) % Q
+
+
+# ==========================================
+# 2. 协议初始化 (Setup)
+# ==========================================
+N = 8  # 范围证明的位数 (N=8 代表证明值在 [0, 255] 之间)
+g = get_random_generator()
+rho = get_random_generator()
+g_arr = [get_random_generator() for _ in range(N)]  # 向量生成器 (g_i)
+
+
+# ==========================================
+# 3. 证明者 (Prover)
+# ==========================================
+def prove(x, N, g, rho, g_arr):
+    # 将 x 转换为二进制数组 b_i
+    b = [(x >> i) & 1 for i in range(N)]
+
+    # 随机性 r_x 用于 Pedersen 承诺
+    r_x = random.randint(1, Q - 1)
+
+    # 计算承诺 X = g^x * rho^r_x
+    X = (pow(g, x, P) * pow(rho, r_x, P)) % P
+
+    # P 生成随机数 m_i, r_q, r_t (Eqn. 12, 13, 14)
+    m = [random.randint(1, Q - 1) for _ in range(N)]
+    r_q = random.randint(1, Q - 1)
+    r_t = random.randint(1, Q - 1)
+
+    # 获取挑战 e 
+    e = hash_to_scalar(X)
+
+    # 计算 T (Eqn. 15, 262)
+    # T = rho^r_t * (g^{\sum 2^i m_i})^e * \prod g_i^{(1-2b_i)m_i}
+    T = pow(rho, r_t, P)
+    sum_2i_mi = sum((2 ** i) * m[i] for i in range(N)) % Q
+    T = (T * pow(g, (sum_2i_mi * e) % Q, P)) % P
+    for i in range(N):
+        exp = ((1 - 2 * b[i]) * m[i]) % Q
+        T = (T * pow(g_arr[i], exp, P)) % P
+
+    # 计算 Q (Eqn. 16, 263)
+    # Q = rho^r_q * \prod g_i^{-m_i^2}
+    Q_val = pow(rho, r_q, P)
+    for i in range(N):
+        exp_neg_m2 = (-m[i] ** 2) % Q
+        Q_val = (Q_val * pow(g_arr[i], exp_neg_m2, P)) % P
+
+    # 获取挑战 y 
+    y = hash_to_scalar(X, e, T, Q_val)
+
+    # 计算响应 z 和 s (Eqn. 17, 18, 267, 270)
+    # z_i = b_i + m_i * y
+    z = [(b[i] + m[i] * y) % Q for i in range(N)]
+
+    # s = r_x * e + r_t * y + r_q * y^2
+    s = (r_x * e + r_t * y + r_q * pow(y, 2, Q)) % Q
+
+    return {
+        "X": X,
+        "T": T,
+        "Q": Q_val,
+        "z": z,
+        "s": s
+    }
+
+
+# ==========================================
+# 4. 验证者 (Verifier) 
+# ==========================================
+def verify(proof, N, g, rho, g_arr):
+    X = proof["X"]
+    T = proof["T"]
+    Q_val = proof["Q"]
+    z = proof["z"]
+    s = proof["s"]
+
+    # 重新计算挑战 e 和 y
+    e = hash_to_scalar(X)
+    y = hash_to_scalar(X, e, T, Q_val)
+
+    # 计算等式左边 LHS = h^z * g^{-z^2} (Eqn. 20, 276)
+    # 其中 h_i = g^{2^i * e} * g_i (Eqn. 11, 250)
+    LHS = 1
+    for i in range(N):
+        # 计算 (h_i)^{z_i} = (g^{2^i * e} * g_i)^{z_i}
+        h_i = (pow(g, ((2 ** i) * e) % Q, P) * g_arr[i]) % P
+        LHS = (LHS * pow(h_i, z[i], P)) % P
+
+        # 计算 g_i^{-z_i^2}
+        exp_neg_z2 = (-z[i] ** 2) % Q
+        LHS = (LHS * pow(g_arr[i], exp_neg_z2, P)) % P
+
+    # 计算等式右边 RHS = rho^{-s} * X^e * T^y * Q^{y^2} (Eqn. 19, 272)
+    RHS = pow(rho, (-s) % Q, P)
+    RHS = (RHS * pow(X, e, P)) % P
+    RHS = (RHS * pow(T, y, P)) % P
+    RHS = (RHS * pow(Q_val, pow(y, 2, Q), P)) % P
+
+    return LHS == RHS
+
+
+# ==========================================
+# 5. 测试执行
+# ==========================================
+if __name__ == "__main__":
+    secret_value = 100  # 我们要证明的值 (在 0 到 2^8 - 1 之间)
+
+    print(f"正在证明值 {secret_value} 在 [0, {2 ** N - 1}] 范围内...")
+
+    # 1. 证明者生成证明
+    proof = prove(secret_value, N, g, rho, g_arr)
+    print("\n生成的证明数据:")
+    print(f"  承诺 X (截断): ...{str(proof['X'])[-10:]}")
+    print(f"  响应 s (截断): ...{str(proof['s'])[-10:]}")
+
+    # 2. 验证者校验明
+    is_valid = verify(proof, N, g, rho, g_arr)
+    print(f"\n验证结果: {'成功 (Valid)' if is_valid else '失败 (Invalid)'}")
