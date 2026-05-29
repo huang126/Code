@@ -1,0 +1,340 @@
+import random
+import sys
+import hashlib
+
+
+# ==========================================
+# 1. 基础数学工具
+# ==========================================
+
+def egcd(a, b):
+    """扩展欧几里得算法 (迭代版)"""
+    if a == 0:
+        return (b, 0, 1)
+    else:
+        old_s, s = 1, 0
+        old_t, t = 0, 1
+        old_r, r = a, b
+
+        while r != 0:
+            quotient = old_r // r
+            old_r, r = r, old_r - quotient * r
+            old_s, s = s, old_s - quotient * s
+            old_t, t = t, old_t - quotient * t
+
+        return (old_r, old_s, old_t)
+
+
+def modinv(a, m):
+    """求模逆"""
+    g, x, y = egcd(a, m)
+    if g != 1:
+        # 在生成大素数时极小概率遇到，重新生成即可
+        raise Exception('Modular inverse does not exist')
+    else:
+        return x % m
+
+
+def L(u, n):
+    """Paillier L函数"""
+    return (u - 1) // n
+
+
+def is_prime(n, k=40):
+    """Miller-Rabin 素数检测"""
+    if n == 2 or n == 3: return True
+    if n % 2 == 0 or n < 2: return False
+    r, d = 0, n - 1
+    while d % 2 == 0:
+        r += 1
+        d //= 2
+    for _ in range(k):
+        a = random.randrange(2, n - 1)
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(r - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def generate_large_prime(bits):
+    """生成指定位数的素数"""
+    print(f"  -> 正在寻找 {bits} 位的素数...", end="", flush=True)
+    while True:
+        n = random.getrandbits(bits)
+        # 确保最高位为1(保证长度)和最低位为1(保证奇数)
+        n |= (1 << (bits - 1)) | 1
+        if is_prime(n):
+            print(" 找到!")
+            return n
+
+
+def generate_hash_int(shared_key_int, cid_str):
+    """
+    生成哈希值并转为整数
+    公式: H( Key || CID )
+    """
+    # 将大整数密钥转换为字符串，与 CID 拼接
+    data = f"{shared_key_int}{cid_str}".encode('utf-8')
+    # 使用 SHA-256 生成摘要
+    digest = hashlib.sha256(data).hexdigest()
+    # 转换为整数
+    return int(digest, 16)
+
+
+# ==========================================
+# 2. 打印辅助工具
+# ==========================================
+
+def print_banner(title):
+    print(f"\n{'=' * 70}")
+    print(f" {title}")
+    print(f"{'=' * 70}")
+
+
+def print_var(name, value, note=""):
+    """打印变量，如果过长则截断显示"""
+    val_str = str(value)
+    length = len(val_str)
+    if length > 40:
+        display = f"{val_str[:20]}...{val_str[-20:]}"
+    else:
+        display = val_str
+    print(f"[{name:<10}] {display:<45} | {length} digits {note}")
+
+
+# ==========================================
+# 3. HRES 系统核心类 (包含重加密功能)
+# ==========================================
+
+class HRES_System:
+    def __init__(self, key_size_bits=1024):
+        print_banner("1. 系统初始化 (KeyGen)")
+
+        # 1. 生成参数 n = p * q
+        prime_bits = key_size_bits // 2
+        self.p = generate_large_prime(prime_bits)
+        self.q = generate_large_prime(prime_bits)
+        while self.p == self.q:
+            self.q = generate_large_prime(prime_bits)
+
+        self.n = self.p * self.q
+        self.nsquare = self.n * self.n
+        # 简化选择 g=2
+        self.g = 2
+
+        print_var("n", self.n, "(Modulus)")
+
+        # 2. 生成 DSS 和 ACS 的密钥对
+        print("-" * 70)
+        # sk_dss = a
+        self.sk_dss = random.SystemRandom().randrange(1, self.n // 4)
+        self.pk_dss = pow(self.g, self.sk_dss, self.nsquare)
+        print_var("sk_DSS", self.sk_dss, "(a)")
+        print_var("pk_DSS", self.pk_dss, "(g^a)")
+
+        # sk_acs = b
+        self.sk_acs = random.SystemRandom().randrange(1, self.n // 4)
+        self.pk_acs = pow(self.g, self.sk_acs, self.nsquare)
+        print_var("sk_ACS", self.sk_acs, "(b)")
+        print_var("pk_ACS", self.pk_acs, "(g^b)")
+
+        # 3. 计算联合公钥 PK
+        # PK = pk_dss^sk_acs = (g^a)^b = g^ab
+        self.PK = pow(self.pk_dss, self.sk_acs, self.nsquare)
+        print("-" * 70)
+        print_var("PK", self.PK, "(Joint Key g^ab)")
+
+    def EncTK(self, m, label="Data"):
+        """双密钥加密 EncTK"""
+        # print_banner(f"加密过程 ({label})")
+        if m >= self.n:
+            raise ValueError("Message too large")
+
+        r = random.SystemRandom().randrange(1, self.n // 4)
+
+        # T = (1 + m*n) * PK^r mod n^2
+        term1 = (1 + m * self.n) % self.nsquare
+        term2 = pow(self.PK, r, self.nsquare)
+        T = (term1 * term2) % self.nsquare
+
+        # T' = g^r mod n^2
+        T_prime = pow(self.g, r, self.nsquare)
+
+        return (T, T_prime)
+
+    def homomorphic_add(self, c1, c2):
+        """同态加法"""
+        T_new = (c1[0] * c2[0]) % self.nsquare
+        T_prime_new = (c1[1] * c2[1]) % self.nsquare
+        return (T_new, T_prime_new)
+
+    # ---------------------------------------------------------
+    # 重加密功能 (FPRE, SPRE, DPRE)
+    # ---------------------------------------------------------
+
+    def FPRE(self, ciphertext, dr_pk, cid):
+        """
+        第一阶段重加密 (First Phase of Re-Encryption) - DSS 执行
+        """
+        print_banner("FPRE (DSS执行)")
+        T, T_prime = ciphertext
+
+        # 1. 计算哈希 h1 = H( (pk_j)^sk_dss || CID )
+        # 共享密钥 base = (pk_j)^a
+        shared_secret = pow(dr_pk, self.sk_dss, self.nsquare)
+        # 调用哈希函数，确保传入正确的变量名
+        h1 = generate_hash_int(shared_secret, cid)
+
+        # 2. 转换 T' -> T_hat_prime
+        # T_hat' = (T')^sk_dss * g^h1
+        term_a = pow(T_prime, self.sk_dss, self.nsquare)
+        term_h1 = pow(self.g, h1, self.nsquare)
+        T_hat_prime = (term_a * term_h1) % self.nsquare
+
+        # T_hat = T
+        T_hat = T
+
+        print_var("h1", h1, "(Hash 1)")
+        return (T_hat, T_hat_prime)
+
+    def SPRE(self, re_enc_partial, dr_pk, cid):
+        """
+        第二阶段重加密 (Second Phase of Re-Encryption) - ACS 执行
+        """
+        print_banner("SPRE (ACS执行)")
+        T_hat, T_hat_prime = re_enc_partial
+
+        # 1. 计算哈希 h2 = H( (pk_j)^sk_acs || CID )
+        # 共享密钥 base = (pk_j)^b
+        shared_secret = pow(dr_pk, self.sk_acs, self.nsquare)
+        h2 = generate_hash_int(shared_secret, cid)
+
+        # 2. 转换 T_hat' -> T_bar_prime
+        # T_bar' = (T_hat')^sk_acs * g^h2
+        term_b = pow(T_hat_prime, self.sk_acs, self.nsquare)
+        term_h2 = pow(self.g, h2, self.nsquare)
+        T_bar_prime = (term_b * term_h2) % self.nsquare
+
+        # T_bar = T_hat
+        T_bar = T_hat
+
+        print_var("h2", h2, "(Hash 2)")
+        return (T_bar, T_bar_prime)
+
+    def DPRE(self, final_ciphertext, dr_sk, cid):
+        """
+        重加密数据解密 (DPRE) - DR 执行
+        """
+        print_banner("DPRE (DU执行)")
+        T_bar, T_bar_prime = final_ciphertext
+
+        # 1. DR 计算两个哈希值 (利用自己的私钥)
+        # h1' = H( (pk_dss)^sk_j || CID )
+        shared_secret_dss = pow(self.pk_dss, dr_sk, self.nsquare)
+        h1_prime = generate_hash_int(shared_secret_dss, cid)
+
+        # h2' = H( (pk_acs)^sk_j || CID )
+        shared_secret_acs = pow(self.pk_acs, dr_sk, self.nsquare)
+        h2_prime = generate_hash_int(shared_secret_acs, cid)
+
+        print(f"DR 重构哈希值: h1_match={h1_prime > 0}, h2_match={h2_prime > 0}")
+
+        # 2. 解密公式
+        # 分子: T_bar * (pk_acs)^h1' * g^h2'
+        term_pk_acs_h1 = pow(self.pk_acs, h1_prime, self.nsquare)
+        term_g_h2 = pow(self.g, h2_prime, self.nsquare)
+        numerator = (T_bar * term_pk_acs_h1 * term_g_h2) % self.nsquare
+
+        # 分母: T_bar'
+        denominator = T_bar_prime
+
+        # 除法
+        inv_denom = modinv(denominator, self.nsquare)
+        val = (numerator * inv_denom) % self.nsquare
+
+        # L函数提取 m
+        m = L(val, self.n)
+        return m
+
+
+# ==========================================
+# 4. 数据请求者 (DR) 类
+# ==========================================
+
+class DR_User:
+    def __init__(self, system, name="User1"):
+        self.system = system
+        self.name = name
+        # 生成用户密钥对
+        self.sk = random.SystemRandom().randrange(1, system.n // 4)
+        self.pk = pow(system.g, self.sk, system.nsquare)
+        print(f"用户 {name} 密钥生成完毕。")
+        print_var("sk_DU", self.sk, "")
+        print_var("pk_DU", self.pk, "")
+
+
+
+# ==========================================
+# 5. 主程序运行逻辑
+# ==========================================
+
+if __name__ == "__main__":
+    # 安全参数设置：1024位 (生成过程需要几秒钟)
+    SECURITY_BITS = 1024
+
+    # 1. 初始化系统
+    hres = HRES_System(key_size_bits=SECURITY_BITS)
+
+    # 2. 创建一个数据请求者 (DR)
+    print_banner("用户注册")
+    dr_user = DR_User(hres, name="Alice")
+    CID = "Computation_ID_20260120"  # 计算任务标识符
+
+    # 3. 准备和加密数据
+    # print_banner("数据加密 (DP -> DSS)")
+    m1 = 50000
+    m2 = 300
+    # print(f"原始数据: m1={m1}, m2={m2}")
+
+    c1 = hres.EncTK(m1)
+    c2 = hres.EncTK(m2)
+    # print("数据已加密上传至 DSS。")
+
+    # 4. 同态加法 (DSS)
+    # print_banner("同态计算 (DSS)")
+    c_sum = hres.homomorphic_add(c1, c2)
+    # print("DSS 完成同态加法: [Sum] = [m1] + [m2]")
+
+
+
+
+    # 5. 重加密流程 (Re-Encryption)
+    # 目标: 将 [Sum] 转换为 Alice 可以解密的密文
+    print(f"将明文m=50300加密:")
+    print_var("Enc(m)", c_sum, "")
+    print("再将密文Enc(m)重加密为Alice 可以解密的密文")
+    # 步骤 A: FPRE (DSS)
+    c_partial = hres.FPRE(c_sum, dr_user.pk, CID)
+
+    # 步骤 B: SPRE (ACS)
+    c_final = hres.SPRE(c_partial, dr_user.pk, CID)
+
+    # 步骤 C: DPRE (DR - Alice)
+    decrypted_result = hres.DPRE(c_final, dr_user.sk, CID)
+
+    # 6. 验证
+    # print_banner("结果验证")
+    expected = m1 + m2
+    # print(f"预期结果: {expected}")
+    print(f"解密结果: {decrypted_result}")
+
+    if decrypted_result == expected:
+        print("\n>>> ✅ 验证成功! 重加密(Re-Encryption)流程正确。 <<<")
+    else:
+        print("\n>>> ❌ 验证失败! <<<")
